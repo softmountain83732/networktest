@@ -33,7 +33,7 @@ Recommended:
   ALLOWED_CHAT_IDS=-1001234567890,@my_public_channel,1234567890
 
 Optional:
-  ALLOW_ANY_CHAT=false             # Set true only for trusted private use
+  ALLOW_ANY_CHAT=true             # Set true only for trusted private use
   CONCURRENT_IO=3                  # Use 3 or 5 for bounded throughput
   TMP_DOWNLOAD_DIR=tmp_media
   BOT_SESSION_FILE=bot_session
