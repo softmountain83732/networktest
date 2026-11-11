@@ -1,806 +1,509 @@
-"""
-Authorized Telegram media archival/delivery bot.
 
-This bot keeps two Telethon clients alive in one asyncio program:
-
-1. user_client
-   A user session that can read messages/media from chats where that user is
-   already authorized.
-
-2. bot_client
-   A bot-token session that receives Telegram message links and sends the
-   requested content back to the requesting chat.
-
-Important operating model
--------------------------
-Use this only for chats and content you own or have explicit permission to
-process. By default, this script requires an ALLOWED_CHAT_IDS allowlist unless
-ALLOW_ANY_CHAT=true is explicitly set.
-
-Environment variables
----------------------
-Required:
-  API_ID=123456
-  API_HASH=0123456789abcdef0123456789abcdef
-  BOT_TOKEN=123456:ABCDEF...
-
-User session, choose one:
-  USER_SESSION=...                 # Telethon StringSession
-  USER_SESSION_FILE=user_session   # Local .session filename/path
-
-Recommended:
-  OWNER_IDS=11111111,22222222      # Users allowed to command the bot
-  ALLOWED_CHAT_IDS=-1001234567890,@my_public_channel,1234567890
-
-Optional:
-  ALLOW_ANY_CHAT=true             # Set true only for trusted private use
-  CONCURRENT_IO=3                  # Use 3 or 5 for bounded throughput
-  TMP_DOWNLOAD_DIR=tmp_media
-  BOT_SESSION_FILE=bot_session
-"""
-
-from __future__ import annotations
-
-import asyncio
-import logging
-import mimetypes
 import os
-import random
-import re
-import uuid
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Awaitable, Callable, Iterable, Optional, Sequence
+import sys
+import time
+import asyncio
+import platform
+import socket
+import shutil
+import html
+import logging
+import subprocess
 
-import aiofiles.os as aio_os
-from telethon import TelegramClient, events, functions, types, utils
-from telethon.errors import FloodWaitError, RPCError
-from telethon.sessions import StringSession
-from telethon.tl.custom.message import Message
+import psutil
+import speedtest
 
-
-LOG = logging.getLogger("restricted_content_archiver")
-
-
-# Matches:
-#   https://t.me/some_public_channel/123
-#   https://telegram.me/some_public_channel/123?single
-#   https://t.me/c/1234567890/123
-#
-# Telegram private channel links omit the MTProto marker. For
-# t.me/c/1234567890/42, the marked peer id is -1001234567890.
-LINK_RE = re.compile(
-    r"(?ix)"
-    r"""
-    (?:https?://)?
-    (?:www\.)?
-    t(?:elegram)?\.me/
-    (?:
-        c/(?P<private_chat_id>\d+)/(?P<private_message_id>\d+)
-        |
-        (?:s/)?(?P<username>[a-zA-Z0-9_]{5,32})/(?P<public_message_id>\d+)
-    )
-    (?:[/?#][^\s]*)?
-    """
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
 )
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-@dataclass(frozen=True)
-class Settings:
-    api_id: int
-    api_hash: str
-    bot_token: str
-    user_session: Optional[str]
-    user_session_file: str
-    bot_session_file: str
-    owner_ids: set[int]
-    allowed_chat_ids: set[str]
-    allow_any_chat: bool
-    concurrent_io: int
-    tmp_download_dir: Path
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class ParsedLink:
-    original: str
-    entity_ref: str | int
-    message_id: int
-    kind: str
-    private_link_chat_id: Optional[int] = None
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
-
-@dataclass
-class UploadedMedia:
-    index: int
-    message: Message
-    local_path: Path
-    uploaded_file: object
-
-
-def _bool_from_env(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _csv_set(name: str) -> set[str]:
-    raw = os.getenv(name, "")
-    return {item.strip() for item in raw.split(",") if item.strip()}
-
-
-def _csv_int_set(name: str) -> set[int]:
-    values: set[int] = set()
-    for item in _csv_set(name):
-        try:
-            values.add(int(item))
-        except ValueError:
-            raise ValueError(f"{name} contains a non-integer value: {item!r}")
-    return values
-
-
-def load_settings() -> Settings:
-    """Read environment variables once at startup and validate hard failures."""
-
-    missing = [name for name in ("API_ID", "API_HASH", "BOT_TOKEN") if not os.getenv(name)]
-    if missing:
-        raise RuntimeError(f"Missing required environment variable(s): {', '.join(missing)}")
-
+def read_file(path):
     try:
-        api_id = int(os.environ["API_ID"])
-    except ValueError as exc:
-        raise RuntimeError("API_ID must be an integer") from exc
-
-    # The semaphore is the hard cap for concurrent disk/network I/O workers.
-    # Values above 5 usually buy little and can increase FloodWait pressure.
-    concurrent_io = int(os.getenv("CONCURRENT_IO", "3"))
-    if concurrent_io < 1:
-        raise RuntimeError("CONCURRENT_IO must be at least 1")
-    if concurrent_io > 5:
-        LOG.warning("CONCURRENT_IO=%s is high; clamping to 5", concurrent_io)
-        concurrent_io = 5
-
-    return Settings(
-        api_id=api_id,
-        api_hash=os.environ["API_HASH"],
-        bot_token=os.environ["BOT_TOKEN"],
-        user_session=os.getenv("USER_SESSION") or None,
-        user_session_file=os.getenv("USER_SESSION_FILE", "user_session"),
-        bot_session_file=os.getenv("BOT_SESSION_FILE", "bot_session"),
-        owner_ids=_csv_int_set("OWNER_IDS"),
-        allowed_chat_ids={item.lower() for item in _csv_set("ALLOWED_CHAT_IDS")},
-        allow_any_chat=_bool_from_env("ALLOW_ANY_CHAT", default=False),
-        concurrent_io=concurrent_io,
-        tmp_download_dir=Path(os.getenv("TMP_DOWNLOAD_DIR", "tmp_media")),
-    )
-
-
-def parse_message_link(text: str) -> Optional[ParsedLink]:
-    """Extract the first supported Telegram message link from free text."""
-
-    match = LINK_RE.search(text or "")
-    if not match:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except (OSError, IOError):
         return None
 
-    if match.group("private_chat_id"):
-        private_chat_id = int(match.group("private_chat_id"))
-        message_id = int(match.group("private_message_id"))
 
-        # MTProto "marked" channel ids use the -100 prefix. Telethon accepts
-        # this integer form and resolves it to the corresponding InputPeer.
-        mtproto_peer_id = int(f"-100{private_chat_id}")
+def format_bytes(value):
+    if value is None:
+        return "N/A"
 
-        return ParsedLink(
-            original=match.group(0),
-            entity_ref=mtproto_peer_id,
-            message_id=message_id,
-            kind="private",
-            private_link_chat_id=private_chat_id,
-        )
+    value = float(value)
 
-    username = match.group("username")
-    return ParsedLink(
-        original=match.group(0),
-        entity_ref=username,
-        message_id=int(match.group("public_message_id")),
-        kind="public",
-    )
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if value < 1024 or unit == "TB":
+            return f"{value:.2f} {unit}"
+        value /= 1024
+
+    return f"{value:.2f} TB"
 
 
-def _normal_allowed_tokens(settings: Settings) -> set[str]:
-    """Normalize allowlist tokens for low-friction config."""
+def format_speed(value):
+    if value is None:
+        return "N/A"
 
-    tokens: set[str] = set()
-    for item in settings.allowed_chat_ids:
-        if item.startswith("@"):
-            tokens.add(item.lower())
-        else:
-            tokens.add(item)
-    return tokens
+    return f"{value / 1_000_000:.2f} Mbps"
 
 
-def is_chat_allowed(entity: object, parsed: ParsedLink, settings: Settings) -> bool:
-    """Allow by marked peer id, private-link id, or public @username."""
+def get_cpu_model():
+    # Linux / Heroku
+    cpuinfo = read_file("/proc/cpuinfo")
 
-    if settings.allow_any_chat:
-        return True
+    if cpuinfo:
+        for line in cpuinfo.splitlines():
+            if line.lower().startswith("model name"):
+                return line.split(":", 1)[1].strip()
 
-    allowed = _normal_allowed_tokens(settings)
-    if not allowed:
-        return False
+            if line.lower().startswith("hardware"):
+                return line.split(":", 1)[1].strip()
 
-    # Marked peer id examples:
-    #   channel: -1001234567890
-    #   basic chat: -123456789
-    peer_id = utils.get_peer_id(entity)
-    candidates = {str(peer_id)}
-
-    # For t.me/c links, operators often copy the bare c/<id> part into config.
-    if parsed.private_link_chat_id is not None:
-        candidates.add(str(parsed.private_link_chat_id))
-        candidates.add(f"-100{parsed.private_link_chat_id}")
-
-    username = getattr(entity, "username", None)
-    if username:
-        candidates.add(username.lower())
-        candidates.add(f"@{username.lower()}")
-
-    return bool(candidates & allowed)
+    # Fallback
+    return platform.processor() or "Unknown"
 
 
-def _first_text_message(messages: Sequence[Message]) -> Message:
-    """Prefer the album item that actually carries the caption."""
-
-    for message in messages:
-        if message.raw_text:
-            return message
-    return messages[0]
-
-
-async def with_flood_retry(
-    operation: Callable[[], Awaitable[object]],
-    label: str,
-    *,
-    max_attempts: int = 6,
-) -> object:
-    """
-    Run a Telethon coroutine factory with FloodWait-aware retry.
-
-    The operation is a factory rather than an already-created coroutine because
-    a failed coroutine cannot be awaited twice.
-    """
-
-    attempt = 0
-    while True:
-        try:
-            return await operation()
-        except FloodWaitError as exc:
-            attempt += 1
-            if attempt >= max_attempts:
-                raise
-
-            # Add a tiny jitter so a batch of concurrent workers does not wake
-            # up on the exact same loop tick and immediately collide again.
-            wait_for = int(exc.seconds) + 1 + random.uniform(0.0, 1.0)
-            LOG.warning(
-                "FloodWait during %s: sleeping %.1fs before retry %s/%s",
-                label,
-                wait_for,
-                attempt,
-                max_attempts,
-            )
-            await asyncio.sleep(wait_for)
-
-
-async def safe_remove(path: Path) -> None:
-    """Best-effort async file deletion; logs but does not mask delivery errors."""
-
+def get_cpu_frequency():
     try:
-        await aio_os.remove(path)
-        LOG.debug("Removed temp file %s", path)
-    except FileNotFoundError:
-        return
-    except OSError:
-        LOG.exception("Could not remove temp file %s", path)
+        freq = psutil.cpu_freq()
 
+        if freq and freq.current:
+            return f"{freq.current:.0f} MHz"
 
-async def cleanup_uploads(uploaded: Iterable[UploadedMedia]) -> None:
-    """Remove all local files produced for a request."""
-
-    await asyncio.gather(*(safe_remove(item.local_path) for item in uploaded), return_exceptions=True)
-
-
-def _source_filename(message: Message) -> Optional[str]:
-    """Read Telegram's original filename attribute when it exists."""
-
-    document = message.document
-    if not document:
-        return None
-
-    for attr in document.attributes or []:
-        if isinstance(attr, types.DocumentAttributeFilename):
-            return attr.file_name
-    return None
-
-
-def _extension_for_message(message: Message) -> str:
-    """Choose a stable extension so Telethon writes to the exact path we pass."""
-
-    filename = _source_filename(message)
-    if filename:
-        suffix = Path(filename).suffix
-        if suffix:
-            return suffix
-
-    if message.photo:
-        return ".jpg"
-
-    if message.document and message.document.mime_type:
-        guessed = mimetypes.guess_extension(message.document.mime_type)
-        if guessed:
-            return guessed
-
-    return ".bin"
-
-
-def temp_path_for(message: Message, index: int, directory: Path) -> Path:
-    """Create a collision-resistant path for one downloaded media item."""
-
-    extension = _extension_for_message(message)
-    return directory / f"{message.id}_{index}_{uuid.uuid4().hex}{extension}"
-
-
-def _document_attributes(message: Message, local_path: Path) -> list[types.TypeDocumentAttribute]:
-    """
-    Preserve Telegram document attributes where possible.
-
-    Attributes carry important presentation details such as original filename,
-    video dimensions/duration, audio performer/title, voice note flag, and
-    animated GIF metadata.
-    """
-
-    attrs: list[types.TypeDocumentAttribute] = []
-    if message.document:
-        attrs.extend(message.document.attributes or [])
-
-    has_filename = any(isinstance(attr, types.DocumentAttributeFilename) for attr in attrs)
-    if not has_filename:
-        attrs.append(types.DocumentAttributeFilename(file_name=local_path.name))
-
-    return attrs
-
-
-def build_uploaded_input_media(uploaded: UploadedMedia) -> types.TypeInputMedia:
-    """
-    Convert an already-uploaded file handle into raw MTProto input media.
-
-    Telethon's high-level send_file is excellent for simple sends, but building
-    InputSingleMedia explicitly gives us precise per-item captions/entities for
-    albums while still using the bot client's async upload_file step.
-    """
-
-    message = uploaded.message
-
-    if message.photo:
-        return types.InputMediaUploadedPhoto(file=uploaded.uploaded_file)
-
-    mime_type = "application/octet-stream"
-    if message.document and message.document.mime_type:
-        mime_type = message.document.mime_type
-    else:
-        guessed, _ = mimetypes.guess_type(uploaded.local_path.name)
-        if guessed:
-            mime_type = guessed
-
-    return types.InputMediaUploadedDocument(
-        file=uploaded.uploaded_file,
-        mime_type=mime_type,
-        attributes=_document_attributes(message, uploaded.local_path),
-    )
-
-
-def _random_id() -> int:
-    """Telegram requires a unique 64-bit random_id for each outgoing media."""
-
-    return random.getrandbits(63)
-
-
-async def prepare_upload(
-    *,
-    index: int,
-    message: Message,
-    user_client: TelegramClient,
-    bot_client: TelegramClient,
-    semaphore: asyncio.Semaphore,
-    download_dir: Path,
-) -> UploadedMedia:
-    """
-    Download one message's media with the user session, then upload it with the bot.
-
-    The semaphore covers the whole disk/network I/O section, which is the part
-    that can overload local storage, Telegram CDN sessions, or bot API limits.
-    Album callers intentionally spawn many of these with create_task(); the
-    semaphore is the hard throughput governor.
-    """
-
-    local_path = temp_path_for(message, index, download_dir)
-
-    async with semaphore:
-        try:
-            downloaded_path = await with_flood_retry(
-                lambda: user_client.download_media(message, file=str(local_path)),
-                f"download message {message.id}",
-            )
-            if not downloaded_path:
-                raise RuntimeError(f"Message {message.id} did not produce a downloadable file")
-
-            local_path = Path(downloaded_path)
-
-            uploaded_file = await with_flood_retry(
-                lambda: bot_client.upload_file(str(local_path)),
-                f"upload message {message.id}",
-            )
-
-            return UploadedMedia(
-                index=index,
-                message=message,
-                local_path=local_path,
-                uploaded_file=uploaded_file,
-            )
-        except BaseException:
-            # If a worker fails or is cancelled after creating a file, keep the
-            # zero-accumulation guarantee for partial request state.
-            await safe_remove(local_path)
-            raise
-
-
-async def fetch_target_message(
-    user_client: TelegramClient,
-    entity: object,
-    message_id: int,
-) -> Message:
-    message = await with_flood_retry(
-        lambda: user_client.get_messages(entity, ids=message_id),
-        f"fetch message {message_id}",
-    )
-
-    if message is None:
-        raise LookupError(f"Message {message_id} was not found")
-    return message
-
-
-async def collect_album_or_single(
-    user_client: TelegramClient,
-    entity: object,
-    target: Message,
-    *,
-    lookaround: int = 10,
-) -> list[Message]:
-    """
-    Reconstruct a Telegram album by scanning target.id +/- lookaround.
-
-    get_messages(ids=[...]) is efficient because it fetches an exact sparse set
-    rather than walking the whole chat history. Filtering by grouped_id avoids
-    accidentally mixing nearby albums.
-    """
-
-    if not target.grouped_id:
-        return [target]
-
-    start = max(1, target.id - lookaround)
-    ids = list(range(start, target.id + lookaround + 1))
-
-    nearby = await with_flood_retry(
-        lambda: user_client.get_messages(entity, ids=ids),
-        f"fetch album around message {target.id}",
-    )
-
-    album = [
-        message
-        for message in nearby
-        if message is not None and message.grouped_id == target.grouped_id and message.media
-    ]
-    album.sort(key=lambda item: item.id)
-
-    if not album:
-        raise LookupError(f"Could not reconstruct album for grouped_id={target.grouped_id}")
-    return album
-
-
-async def send_text_only(
-    bot_client: TelegramClient,
-    destination: object,
-    message: Message,
-) -> None:
-    """Forward a text-only message by copying raw text and Telegram entities."""
-
-    text = message.raw_text or ""
-    if not text:
-        text = "[empty message]"
-
-    await with_flood_retry(
-        lambda: bot_client.send_message(
-            destination,
-            text,
-            formatting_entities=message.entities or None,
-        ),
-        f"send text message {message.id}",
-    )
-
-
-async def send_single_uploaded(
-    bot_client: TelegramClient,
-    destination: object,
-    uploaded: UploadedMedia,
-    caption_source: Message,
-) -> None:
-    """Send one uploaded media item with its original caption entities."""
-
-    peer = await bot_client.get_input_entity(destination)
-    input_media = build_uploaded_input_media(uploaded)
-
-    await with_flood_retry(
-        lambda: bot_client(
-            functions.messages.SendMediaRequest(
-                peer=peer,
-                media=input_media,
-                message=caption_source.raw_text or "",
-                random_id=_random_id(),
-                entities=caption_source.entities or [],
-            )
-        ),
-        f"send single media {uploaded.message.id}",
-    )
-
-
-async def send_album_uploaded(
-    bot_client: TelegramClient,
-    destination: object,
-    uploaded_items: Sequence[UploadedMedia],
-    caption_source: Message,
-) -> None:
-    """
-    Send uploaded media as coherent Telegram albums.
-
-    Telegram albums have a hard server-side limit of 10 media items. Albums are
-    normally <=10, but chunking keeps the sender safe if Telegram ever returns a
-    larger grouped_id span or a link points into an unusual imported history.
-    """
-
-    peer = await bot_client.get_input_entity(destination)
-    ordered = sorted(uploaded_items, key=lambda item: item.index)
-
-    for chunk_start in range(0, len(ordered), 10):
-        chunk = ordered[chunk_start : chunk_start + 10]
-        multi_media: list[types.InputSingleMedia] = []
-
-        for offset, uploaded in enumerate(chunk):
-            is_first_item_of_first_chunk = chunk_start == 0 and offset == 0
-            caption = caption_source.raw_text if is_first_item_of_first_chunk else ""
-            entities = caption_source.entities if is_first_item_of_first_chunk else []
-
-            multi_media.append(
-                types.InputSingleMedia(
-                    media=build_uploaded_input_media(uploaded),
-                    message=caption or "",
-                    random_id=_random_id(),
-                    entities=entities or [],
-                )
-            )
-
-        await with_flood_retry(
-            lambda: bot_client(
-                functions.messages.SendMultiMediaRequest(
-                    peer=peer,
-                    multi_media=multi_media,
-                )
-            ),
-            f"send album chunk starting {chunk_start}",
-        )
-
-
-async def upload_album_concurrently(
-    *,
-    messages: Sequence[Message],
-    user_client: TelegramClient,
-    bot_client: TelegramClient,
-    semaphore: asyncio.Semaphore,
-    download_dir: Path,
-) -> list[UploadedMedia]:
-    """
-    Spawn one worker task per media item and gather the uploaded file handles.
-
-    This is the performance-critical section: downloads and uploads overlap up
-    to CONCURRENT_IO while preserving original album order by index.
-    """
-
-    tasks = [
-        asyncio.create_task(
-            prepare_upload(
-                index=index,
-                message=message,
-                user_client=user_client,
-                bot_client=bot_client,
-                semaphore=semaphore,
-                download_dir=download_dir,
-            ),
-            name=f"download-upload-{message.id}",
-        )
-        for index, message in enumerate(messages)
-    ]
-
-    try:
-        uploaded = await asyncio.gather(*tasks)
-    except BaseException:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Successful workers already returned local file paths; remove them
-        # because the request will not be delivered as a complete album.
-        await cleanup_uploads(item for item in results if isinstance(item, UploadedMedia))
-        raise
-
-    return sorted(uploaded, key=lambda item: item.index)
-
-
-async def process_link_request(
-    *,
-    event: events.NewMessage.Event,
-    parsed: ParsedLink,
-    settings: Settings,
-    user_client: TelegramClient,
-    bot_client: TelegramClient,
-    semaphore: asyncio.Semaphore,
-) -> None:
-    """Resolve, fetch, upload, send, and clean up one user request."""
-
-    status = await event.reply("Resolving link...")
-    destination = event.chat_id
-    uploaded_items: list[UploadedMedia] = []
-
-    try:
-        entity = await with_flood_retry(
-            lambda: user_client.get_entity(parsed.entity_ref),
-            f"resolve entity {parsed.entity_ref}",
-        )
-
-        if not is_chat_allowed(entity, parsed, settings):
-            await status.edit(
-                "This chat is not in ALLOWED_CHAT_IDS. "
-                "Add it to the allowlist, or set ALLOW_ANY_CHAT=true for trusted private deployments."
-            )
-            return
-
-        await status.edit("Fetching message...")
-        target = await fetch_target_message(user_client, entity, parsed.message_id)
-
-        messages = await collect_album_or_single(user_client, entity, target)
-        media_messages = [message for message in messages if message.media]
-        caption_source = _first_text_message(messages)
-
-        if not media_messages:
-            await status.edit("Sending text...")
-            await send_text_only(bot_client, destination, caption_source)
-            await status.edit("Done.")
-            return
-
-        if len(media_messages) == 1:
-            await status.edit("Downloading and uploading media...")
-            uploaded = await prepare_upload(
-                index=0,
-                message=media_messages[0],
-                user_client=user_client,
-                bot_client=bot_client,
-                semaphore=semaphore,
-                download_dir=settings.tmp_download_dir,
-            )
-            uploaded_items = [uploaded]
-
-            await status.edit("Sending media...")
-            await send_single_uploaded(bot_client, destination, uploaded, caption_source)
-        else:
-            await status.edit(f"Uploading album with {len(media_messages)} items...")
-            uploaded_items = await upload_album_concurrently(
-                messages=media_messages,
-                user_client=user_client,
-                bot_client=bot_client,
-                semaphore=semaphore,
-                download_dir=settings.tmp_download_dir,
-            )
-
-            await status.edit("Sending album...")
-            await send_album_uploaded(bot_client, destination, uploaded_items, caption_source)
-
-        await status.edit("Done.")
-    except FloodWaitError as exc:
-        LOG.exception("FloodWait exhausted while processing %s", parsed.original)
-        await status.edit(f"Telegram rate-limited this request for {exc.seconds}s. Try again later.")
-    except LookupError as exc:
-        await status.edit(str(exc))
-    except RPCError as exc:
-        LOG.exception("Telegram RPC error while processing %s", parsed.original)
-        await status.edit(f"Telegram rejected the request: {exc.__class__.__name__}")
     except Exception:
-        LOG.exception("Unexpected error while processing %s", parsed.original)
-        await status.edit("Unexpected error while processing that link. Check server logs.")
-    finally:
-        # Cleanup happens after delivery attempt. On success this removes every
-        # local file immediately; on failure it prevents partial accumulation.
-        await cleanup_uploads(uploaded_items)
+        pass
+
+    return "N/A"
 
 
-def configure_logging() -> None:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+# ============================================================
+# HEROKU MEMORY LIMIT DETECTION
+# ============================================================
+
+def get_cgroup_memory():
+    """
+    Detect memory limit and usage from cgroup v2 or v1.
+    Returns: (limit, usage)
+    """
+
+    # cgroup v2
+    limit = read_file("/sys/fs/cgroup/memory.max")
+    usage = read_file("/sys/fs/cgroup/memory.current")
+
+    if limit and usage:
+        try:
+            if limit != "max":
+                return int(limit), int(usage)
+        except ValueError:
+            pass
+
+    # cgroup v1
+    limit = read_file(
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+    )
+    usage = read_file(
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes"
     )
 
+    if limit and usage:
+        try:
+            limit_value = int(limit)
+            usage_value = int(usage)
 
-async def main() -> None:
-    configure_logging()
-    settings = load_settings()
-    settings.tmp_download_dir.mkdir(parents=True, exist_ok=True)
+            # Ignore unlimited / unrealistic values
+            if limit_value < 10**15:
+                return limit_value, usage_value
 
-    # Use StringSession in production if available; otherwise Telethon will
-    # create/read a local user_session.session file and may prompt on first run.
-    user_session = (
-        StringSession(settings.user_session)
-        if settings.user_session
-        else settings.user_session_file
-    )
+        except ValueError:
+            pass
 
-    user_client = TelegramClient(user_session, settings.api_id, settings.api_hash)
-    bot_client = TelegramClient(settings.bot_session_file, settings.api_id, settings.api_hash)
+    return None, None
 
-    io_semaphore = asyncio.Semaphore(settings.concurrent_io)
 
-    @bot_client.on(events.NewMessage(incoming=True))
-    async def on_message(event: events.NewMessage.Event) -> None:
-        if not event.raw_text:
-            return
+def get_memory_info():
+    virtual = psutil.virtual_memory()
 
-        sender_id = event.sender_id
-        if settings.owner_ids and sender_id not in settings.owner_ids:
-            await event.reply("You are not authorized to use this bot.")
-            return
+    cgroup_limit, cgroup_usage = get_cgroup_memory()
 
-        parsed = parse_message_link(event.raw_text)
-        if not parsed:
-            await event.reply("Send a Telegram message link, for example: https://t.me/channel/123")
-            return
+    if cgroup_limit and cgroup_usage is not None:
+        total = cgroup_limit
+        used = cgroup_usage
+        available = max(total - used, 0)
+        source = "Heroku cgroup limit"
 
-        await process_link_request(
-            event=event,
-            parsed=parsed,
-            settings=settings,
-            user_client=user_client,
-            bot_client=bot_client,
-            semaphore=io_semaphore,
-        )
+    else:
+        total = virtual.total
+        used = virtual.used
+        available = virtual.available
+        source = "System memory"
+
+    percent = (used / total * 100) if total else 0
+
+    return {
+        "total": total,
+        "used": used,
+        "available": available,
+        "percent": percent,
+        "source": source,
+    }
+
+
+# ============================================================
+# CPU INFORMATION
+# ============================================================
+
+def get_cpu_info():
+    logical = psutil.cpu_count(logical=True) or os.cpu_count() or 1
+    physical = psutil.cpu_count(logical=False)
+
+    # CPU utilization sampling
+    cpu_usage = psutil.cpu_percent(interval=1)
+
+    return {
+        "model": get_cpu_model(),
+        "usage": cpu_usage,
+        "logical": logical,
+        "physical": physical,
+        "frequency": get_cpu_frequency(),
+    }
+
+
+# ============================================================
+# STORAGE INFORMATION
+# ============================================================
+
+def get_storage_info():
+    try:
+        usage = shutil.disk_usage("/")
+
+        total = usage.total
+        used = usage.used
+        free = usage.free
+
+        percent = (used / total * 100) if total else 0
+
+        return {
+            "total": total,
+            "used": used,
+            "free": free,
+            "percent": percent,
+        }
+
+    except Exception as e:
+        logger.exception("Storage detection failed: %s", e)
+        return None
+
+
+# ============================================================
+# NETWORK SPEED TEST
+# ============================================================
+
+def run_speedtest():
+    """
+    Run Ookla Speedtest through speedtest-cli.
+    Returns download/upload in bits per second and ping in ms.
+    """
 
     try:
-        await user_client.start()
-        await bot_client.start(bot_token=settings.bot_token)
+        test = speedtest.Speedtest(timeout=20)
 
-        me = await bot_client.get_me()
-        LOG.info("Bot client started as @%s", getattr(me, "username", None) or me.id)
-        LOG.info("Concurrent media workers: %s", settings.concurrent_io)
+        test.get_best_server()
 
-        if not settings.owner_ids:
-            LOG.warning("OWNER_IDS is empty; any user who can message the bot may send requests")
-        if not settings.allowed_chat_ids and not settings.allow_any_chat:
-            LOG.warning("ALLOWED_CHAT_IDS is empty and ALLOW_ANY_CHAT=false; all content links will be denied")
+        download = test.download()
+        upload = test.upload()
 
-        await bot_client.run_until_disconnected()
-    finally:
-        await asyncio.gather(
-            user_client.disconnect(),
-            bot_client.disconnect(),
-            return_exceptions=True,
+        ping = test.results.ping
+
+        server = test.results.server
+
+        return {
+            "download": download,
+            "upload": upload,
+            "ping": ping,
+            "server": server.get("name", "Unknown"),
+            "country": server.get("country", "Unknown"),
+            "sponsor": server.get("sponsor", "Unknown"),
+            "error": None,
+        }
+
+    except Exception as e:
+        logger.exception("Network speed test failed")
+
+        return {
+            "download": None,
+            "upload": None,
+            "ping": None,
+            "server": None,
+            "country": None,
+            "sponsor": None,
+            "error": str(e),
+        }
+
+
+# ============================================================
+# SYSTEM INFORMATION
+# ============================================================
+
+def get_system_info():
+    return {
+        "hostname": socket.gethostname(),
+        "os": platform.system(),
+        "os_version": platform.release(),
+        "architecture": platform.machine(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "heroku_dyno": os.getenv("DYNO", "Not detected"),
+        "heroku_app": os.getenv("HEROKU_APP_NAME", "Not available"),
+    }
+
+
+# ============================================================
+# COLLECT ALL INFORMATION
+# ============================================================
+
+def collect_server_info():
+    result = {}
+
+    # CPU
+    result["cpu"] = get_cpu_info()
+
+    # RAM
+    result["memory"] = get_memory_info()
+
+    # Disk
+    result["storage"] = get_storage_info()
+
+    # System
+    result["system"] = get_system_info()
+
+    # Network
+    result["network"] = run_speedtest()
+
+    return result
+
+
+# ============================================================
+# REPORT GENERATOR
+# ============================================================
+
+def generate_report(data):
+    cpu = data["cpu"]
+    memory = data["memory"]
+    storage = data["storage"]
+    network = data["network"]
+    system = data["system"]
+
+    physical_cores = (
+        str(cpu["physical"])
+        if cpu["physical"] is not None
+        else "Unavailable"
+    )
+
+    report = []
+
+    report.append("<b>HEROKU SERVER MONITOR</b>")
+    report.append("<code>━━━━━━━━━━━━━━━━━━━━</code>")
+
+    # NETWORK
+    report.append("\n<b>NETWORK PERFORMANCE</b>")
+
+    if network["error"]:
+        report.append("Status: <b>Failed</b>")
+        report.append(
+            f"Error: <code>{html.escape(network['error'][:250])}</code>"
         )
+    else:
+        report.append(
+            f"Download: <b>{format_speed(network['download'])}</b>"
+        )
+        report.append(
+            f"Upload: <b>{format_speed(network['upload'])}</b>"
+        )
+        report.append(
+            f"Ping: <b>{network['ping']:.2f} ms</b>"
+        )
+        report.append(
+            f"Server: {html.escape(str(network['server']))}, "
+            f"{html.escape(str(network['country']))}"
+        )
+        report.append(
+            f"Provider: {html.escape(str(network['sponsor']))}"
+        )
+
+    # CPU
+    report.append("\n<b>CPU INFORMATION</b>")
+    report.append(
+        f"Model: <code>{html.escape(cpu['model'])}</code>"
+    )
+    report.append(
+        f"Usage: <b>{cpu['usage']:.1f}%</b>"
+    )
+    report.append(
+        f"Logical Cores: <b>{cpu['logical']}</b>"
+    )
+    report.append(
+        f"Physical Cores: <b>{physical_cores}</b>"
+    )
+    report.append(
+        f"Frequency: <b>{cpu['frequency']}</b>"
+    )
+
+    # MEMORY
+    report.append("\n<b>RAM INFORMATION</b>")
+    report.append(
+        f"Total: <b>{format_bytes(memory['total'])}</b>"
+    )
+    report.append(
+        f"Used: <b>{format_bytes(memory['used'])}</b>"
+    )
+    report.append(
+        f"Available: <b>{format_bytes(memory['available'])}</b>"
+    )
+    report.append(
+        f"Usage: <b>{memory['percent']:.1f}%</b>"
+    )
+    report.append(
+        f"Source: {html.escape(memory['source'])}"
+    )
+
+    # STORAGE
+    report.append("\n<b>DISK / SSD INFORMATION</b>")
+
+    if storage:
+        report.append(
+            f"Total: <b>{format_bytes(storage['total'])}</b>"
+        )
+        report.append(
+            f"Used: <b>{format_bytes(storage['used'])}</b>"
+        )
+        report.append(
+            f"Free: <b>{format_bytes(storage['free'])}</b>"
+        )
+        report.append(
+            f"Usage: <b>{storage['percent']:.1f}%</b>"
+        )
+        report.append(
+            "<i>Filesystem visible to the Heroku dyno.</i>"
+        )
+    else:
+        report.append("Storage information unavailable.")
+
+    # SYSTEM
+    report.append("\n<b>SYSTEM INFORMATION</b>")
+    report.append(
+        f"Hostname: <code>{html.escape(system['hostname'])}</code>"
+    )
+    report.append(
+        f"OS: {html.escape(system['os'])} "
+        f"{html.escape(system['os_version'])}"
+    )
+    report.append(
+        f"Architecture: {html.escape(system['architecture'])}"
+    )
+    report.append(
+        f"Python: {html.escape(system['python'])}"
+    )
+    report.append(
+        f"Dyno: <code>{html.escape(system['heroku_dyno'])}</code>"
+    )
+    report.append(
+        f"Heroku App: {html.escape(system['heroku_app'])}"
+    )
+
+    report.append("\n<code>━━━━━━━━━━━━━━━━━━━━</code>")
+    report.append("<i>Powered by Heroku Server Monitor</i>")
+
+    return "\n".join(report)
+
+
+# ============================================================
+# TELEGRAM COMMANDS
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Welcome to Heroku Server Monitor.\n\n"
+        "Use /test to check server performance."
+    )
+
+
+async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status_message = await update.message.reply_text(
+        "⏳ <b>Running Heroku server diagnostics...</b>\n\n"
+        "Checking CPU, RAM, Storage and Network speed.\n"
+        "This may take 30-60 seconds.",
+        parse_mode=ParseMode.HTML,
+    )
+
+    try:
+        # Run blocking system checks and speedtest outside event loop
+        data = await asyncio.to_thread(collect_server_info)
+
+        report = generate_report(data)
+
+        await status_message.edit_text(
+            report,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+    except Exception as e:
+        logger.exception("Server diagnostics failed")
+
+        await status_message.edit_text(
+            "❌ <b>Diagnostics failed</b>\n\n"
+            f"<code>{html.escape(str(e)[:1000])}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is missing. Set BOT_TOKEN in Heroku Config Vars."
+        )
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("test", test))
+
+    logger.info("Heroku Server Monitor started.")
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
